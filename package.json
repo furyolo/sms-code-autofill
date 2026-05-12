@@ -1,0 +1,41 @@
+{
+  "name": "sms-code-autofill",
+  "version": "1.0.0",
+  "description": "SMS Code Autofill browser extension for OpenAI phone verification",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "dev:firefox": "wxt -b firefox",
+    "build": "wxt build",
+    "build:firefox": "wxt build -b firefox",
+    "zip": "wxt zip",
+    "zip:firefox": "wxt zip -b firefox",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "htm": "^3.1.1",
+    "preact": "^10.24.3",
+    "webextension-polyfill": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.280",
+    "typescript": "^5.5.4",
+    "wxt": "^0.19.13"
+  },
+  "main": "index.js",
+  "directories": {
+    "lib": "lib"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/furyolo/sms-code-autofill.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/furyolo/sms-code-autofill/issues"
+  },
+  "homepage": "https://github.com/furyolo/sms-code-autofill#readme"
+}
