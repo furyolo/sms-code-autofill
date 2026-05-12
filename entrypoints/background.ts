@@ -8,6 +8,7 @@ import { defineBackground } from 'wxt/sandbox';
 import { HeroSmsProvider, ProviderRegistry } from '../lib/providers';
 import type { ProviderConfig } from '../lib/providers';
 import { RetryStateMachine } from '../lib/state-machine';
+import { handleBlinkAlarm } from '../lib/badge';
 
 // ---------------------------------------------------------------------------
 // Provider 注册
@@ -121,6 +122,15 @@ chrome.notifications.onButtonClicked.addListener(
 // ---------------------------------------------------------------------------
 
 chrome.alarms.onAlarm.addListener((alarm: chrome.alarms.Alarm) => {
+  // Badge 闪烁 alarm —— 独立处理，不影响状态机轮询
+  if (alarm.name === 'badge_blink') {
+    handleBlinkAlarm().catch((err) => {
+      console.error('[Background] Badge 闪烁错误:', err);
+    });
+    return;
+  }
+
+  // 验证码轮询 alarm —— 转发到状态机
   machine.handleAlarm(alarm).catch((err) => {
     console.error('[Background] Alarm 处理错误:', err);
   });

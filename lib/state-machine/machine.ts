@@ -26,6 +26,12 @@ import {
   dismissNotification,
 } from './notifications';
 import { saveState, loadState, recoverState } from './persistence';
+import {
+  updateBadge,
+  startBadgeBlink,
+  stopBadgeBlink,
+  sendRecoverySignal,
+} from '../badge';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -206,11 +212,24 @@ export class RetryStateMachine {
       `bucket=${computed.currentBucket}/${computed.maxBuckets} attempt=${computed.attemptInBucket}/${computed.bucketSize} total=${computed.totalAttempts}`,
     );
 
-    // 3. 执行副作用（根据新 phase）
+    // 3. 闪烁管理：进入 AWAIT_CONFIRM 时启动，离开时停止
+    if (computed.phase === RetryPhase.AWAIT_CONFIRM && prevPhase !== RetryPhase.AWAIT_CONFIRM) {
+      await startBadgeBlink();
+    }
+    if (prevPhase === RetryPhase.AWAIT_CONFIRM && computed.phase !== RetryPhase.AWAIT_CONFIRM) {
+      await stopBadgeBlink();
+    }
+
+    // 4. 执行副作用（根据新 phase）
     await this.executeSideEffects(this.state, event);
 
-    // 4. 更新 Badge
-    await this.updateBadge(this.state);
+    // 5. 恢复锚定信号：userContinue 时 500ms 内 2 次 Badge 切换
+    if (event.type === 'userContinue') {
+      await sendRecoverySignal(this.state);
+    }
+
+    // 6. 更新 Badge
+    await updateBadge(this.state);
 
     return this.state;
   }
@@ -284,7 +303,7 @@ export class RetryStateMachine {
     });
 
     // 恢复 Badge
-    await this.updateBadge(this.state);
+    await updateBadge(this.state);
   }
 
   /** 销毁状态机，清理资源 */
@@ -622,7 +641,7 @@ export class RetryStateMachine {
     // 进入 GET_PHONE
     state.phase = RetryPhase.GET_PHONE;
     await saveState(state);
-    await this.updateBadge(state);
+    await updateBadge(state);
     await this.handleGetPhone(state, { type: 'start' });
   }
 
@@ -705,7 +724,7 @@ export class RetryStateMachine {
       state.notificationId = notificationId;
       state.phase = RetryPhase.AWAIT_CONFIRM;
       await saveState(state);
-      await this.updateBadge(state);
+      await updateBadge(state);
       console.log('[StateMachine] BUCKET_EXHAUSTED → AWAIT_CONFIRM, notificationId:', notificationId);
     } catch {
       // 通知创建失败，降级为继续
@@ -817,7 +836,7 @@ export class RetryStateMachine {
     this.state = this.createInitialState();
     this.state.lastTransitionAt = Date.now();
     await saveState(this.state);
-    await this.clearBadge();
+    try { await chrome.action.setBadgeText({ text: '' }); } catch { /* 忽略 */ }
     console.log('[StateMachine] 恢复 IDLE，本次共尝试:', oldTotal, '次');
   }
 
@@ -840,59 +859,6 @@ export class RetryStateMachine {
       }
     } catch {
       // 忽略 alarm API 错误
-    }
-  }
-
-  /** 更新 Badge 图标状态 */
-  private async updateBadge(state: RetryState): Promise<void> {
-    try {
-      const { phase, totalAttempts } = state;
-      switch (phase) {
-        case RetryPhase.IDLE:
-          await chrome.action.setBadgeText({ text: '' });
-          break;
-        case RetryPhase.GET_PHONE:
-          await chrome.action.setBadgeBackgroundColor({ color: '#f97316' }); // orange
-          await chrome.action.setBadgeText({ text: String(totalAttempts) });
-          break;
-        case RetryPhase.FILL_PHONE:
-          await chrome.action.setBadgeBackgroundColor({ color: '#f97316' });
-          await chrome.action.setBadgeText({ text: String(totalAttempts) });
-          break;
-        case RetryPhase.WAIT_CODE: {
-          const elapsed = Math.floor((Date.now() - state.startedAt) / 1000);
-          await chrome.action.setBadgeBackgroundColor({ color: '#3b82f6' }); // blue
-          await chrome.action.setBadgeText({ text: String(elapsed) });
-          break;
-        }
-        case RetryPhase.REJECTED:
-        case RetryPhase.BUCKET_EXHAUSTED:
-        case RetryPhase.AWAIT_CONFIRM:
-          await chrome.action.setBadgeBackgroundColor({ color: '#ef4444' }); // red
-          await chrome.action.setBadgeText({ text: '!' });
-          break;
-        case RetryPhase.DONE:
-          await chrome.action.setBadgeBackgroundColor({ color: '#22c55e' }); // green
-          await chrome.action.setBadgeText({ text: 'OK' });
-          break;
-        case RetryPhase.STOPPED:
-          await chrome.action.setBadgeBackgroundColor({ color: '#6b7280' }); // gray
-          await chrome.action.setBadgeText({ text: '' });
-          break;
-        default:
-          break;
-      }
-    } catch {
-      // Badge API 可能不可用
-    }
-  }
-
-  /** 清除 Badge */
-  private async clearBadge(): Promise<void> {
-    try {
-      await chrome.action.setBadgeText({ text: '' });
-    } catch {
-      // 忽略
     }
   }
 
