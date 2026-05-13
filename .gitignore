@@ -13,7 +13,7 @@
 /.worktrees/
 /.venv/
 /.data/
-/.workflow
+/.workflow/
 
 # 跨目录通用的 Python 与测试缓存
 __pycache__/
