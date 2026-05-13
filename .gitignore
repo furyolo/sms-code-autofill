@@ -1,1 +1,40 @@
-.ace-tool/
+# 环境变量文件
+.env
+.env.*
+!.env.example
+/config/.env
+/config/.env.*
+!/config/.env.example
+
+# 仓库根目录下的本地工具与运行产物
+/.ace-tool/
+/.claude/
+/.codex/
+/.worktrees/
+/.venv/
+/.data/
+/.workflow
+
+# 跨目录通用的 Python 与测试缓存
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.log
+
+# 仅忽略仓库根目录下的编辑器配置；子项目自行通过各自 .gitignore 管理
+/.idea/
+/.vscode/
+
+node_modules
+dist
+dist-ssr
+*.local
+test-results
+playwright-report
+.output/
+.wxt/

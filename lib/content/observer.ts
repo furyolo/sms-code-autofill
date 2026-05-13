@@ -81,14 +81,14 @@ function tryFindCodeInput(): HTMLInputElement | null {
 /**
  * 查找并点击提交按钮
  * 三层策略：
- *   1. 文本匹配 "Continue" / "Submit" / "Send code" / "Next"
+ *   1. 文本匹配 "Continue" / "继续" / "Submit" / "Send code" / "Next"
  *   2. type="submit" 的 button
  *   3. 最后一个可见 button
  * @returns 是否找到并点击了按钮
  */
 export function findAndClickSubmitButton(): boolean {
   // 策略 1: 文本匹配
-  const texts = ['Continue', 'Submit', 'Send code', 'Next'];
+  const texts = ['Continue', '继续', 'Submit', 'Send code', 'Next'];
   for (const text of texts) {
     const btn = findButtonByText(text);
     if (btn) {

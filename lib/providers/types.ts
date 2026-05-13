@@ -41,6 +41,8 @@ export interface ProviderConfig {
   service?: string;
   maxPrice?: number;
   proxy?: string;
+  reusePhoneToMax?: boolean;
+  phoneSuccessMax?: number;
 }
 
 /** 号码缓存结构，存储于 chrome.storage.session */

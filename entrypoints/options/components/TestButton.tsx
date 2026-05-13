@@ -6,6 +6,9 @@ const html = htm.bind(h);
 
 interface TestButtonProps {
   apiKey: string;
+  country?: string;
+  service?: string;
+  maxPrice?: number;
   label?: string;
 }
 
@@ -19,7 +22,13 @@ interface TestResult {
  * 点击 → chrome.runtime.sendMessage({ type:'TEST_CONNECTION', apiKey })
  * 成功显示绿色条含余额，失败显示红色条含错误原因，5秒后自动消失
  */
-export default function TestButton({ apiKey, label = '测试连接' }: TestButtonProps) {
+export default function TestButton({
+  apiKey,
+  country,
+  service,
+  maxPrice,
+  label = '测试连接',
+}: TestButtonProps) {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<TestResult | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -45,12 +54,24 @@ export default function TestButton({ apiKey, label = '测试连接' }: TestButto
       const response = await chrome.runtime.sendMessage({
         type: 'TEST_CONNECTION',
         apiKey,
+        country,
+        service,
+        maxPrice,
       });
 
       if (response?.success) {
+        const count = Number(response.count ?? 0);
+        const price = response.price === null || response.price === undefined
+          ? '未知'
+          : `$${Number(response.price).toFixed(4)}`;
+        const target = `${response.service || 'dr'} / 国家 ${response.country || '-'}`;
+        const availability = count > 0 ? `库存 ${count}` : '无库存';
+        const limit = response.priceBlocked
+          ? `，当前最大价格会拦截，建议 ≥ $${Number(response.recommendedMaxPrice).toFixed(4)}`
+          : '';
         setResult({
-          type: 'success',
-          message: `连接成功，余额 $${(response.balance || 0).toFixed(2)}`,
+          type: count > 0 && !response.priceBlocked ? 'success' : 'error',
+          message: `余额 $${(response.balance || 0).toFixed(2)}，${target}，${availability}，价格 ${price}${limit}`,
         });
       } else {
         setResult({

@@ -30,6 +30,13 @@ const CACHE_KEY = 'hero_cache';
 const CACHE_TTL = 20 * 60 * 1000; // 20 分钟（毫秒）
 const MAX_REUSE = 3;
 
+export interface HeroSmsPriceInfo {
+  country: string;
+  service: string;
+  price: number | null;
+  count: number;
+}
+
 // ---------------------------------------------------------------------------
 // 工具函数
 // ---------------------------------------------------------------------------
@@ -114,13 +121,13 @@ export class HeroSmsProvider extends BaseSmsProvider {
       };
     }
 
-    this.apiKey = (config.apiKey || '').trim();
+    this.apiKey = (config.apiKey || apiKey || '').trim();
     this.defaultService = (config.service || DEFAULT_SERVICE).trim();
     this.defaultCountry = (config.country || DEFAULT_COUNTRY).trim();
     this.maxPrice = typeof config.maxPrice === 'number' ? config.maxPrice : -1;
     this.proxy = config.proxy?.trim() || null;
-    this.reusePhoneToMax = true;
-    this.phoneSuccessMax = MAX_REUSE;
+    this.reusePhoneToMax = typeof config.reusePhoneToMax === 'boolean' ? config.reusePhoneToMax : true;
+    this.phoneSuccessMax = typeof config.phoneSuccessMax === 'number' ? config.phoneSuccessMax : MAX_REUSE;
   }
 
   // -------------------------------------------------------------------------
@@ -402,6 +409,32 @@ export class HeroSmsProvider extends BaseSmsProvider {
     throw new TypedError('API', 'BALANCE_PARSE', `获取余额失败: ${text}`, true);
   }
 
+  /** 获取服务/国家价格与库存，不会租用号码。 */
+  async getPrices(service?: string, country?: string): Promise<Record<string, unknown>> {
+    const params: Record<string, string> = { action: 'getPrices' };
+    if (service?.trim()) params.service = service.trim();
+    if (country?.trim()) params.country = country.trim();
+
+    const text = await this._requestText(params, true);
+    try {
+      const data = JSON.parse(text);
+      if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+        return data as Record<string, unknown>;
+      }
+    } catch {
+      // 统一在下方抛出带原始片段的解析错误，方便 Options 诊断显示。
+    }
+    throw new TypedError('API', 'PRICES_PARSE', `价格库存解析失败: ${text.slice(0, 160)}`, true);
+  }
+
+  /** 查询当前服务和国家的库存信息，不会租用号码。 */
+  async getAvailability(service: string, country: string): Promise<HeroSmsPriceInfo | null> {
+    const svc = service || this.defaultService;
+    const ctry = country || this.defaultCountry;
+    const prices = await this.getPrices(svc, ctry);
+    return HeroSmsProvider._extractPriceInfo(prices, svc, ctry);
+  }
+
   /** getStatusV2：JSON 响应，提取 code/sms/call 通道 */
   async getStatusV2(activationId: string): Promise<SmsCandidate> {
     const text = await this._requestText({ action: 'getStatusV2', id: activationId }, false);
@@ -626,16 +659,19 @@ export class HeroSmsProvider extends BaseSmsProvider {
     country: string
   ): Promise<{
     activationId?: string;
-    phoneNumber: string;
-    countryPhoneCode?: string;
+    phoneNumber: string | number;
+    countryPhoneCode?: string | number;
     activationCost?: number;
   }> {
+    const effectiveMaxPrice = await this._resolveEffectiveMaxPrice(service, country);
     const common: Record<string, string> = {
       action: 'getNumberV2',
       service,
       country,
-      maxPrice: String(this.maxPrice > 0 ? this.maxPrice : 1),
     };
+    if (effectiveMaxPrice > 0) {
+      common.maxPrice = String(effectiveMaxPrice);
+    }
 
     // 尝试 V2
     let v2Error = '';
@@ -660,11 +696,12 @@ export class HeroSmsProvider extends BaseSmsProvider {
     // V2 返回 NO_NUMBERS 且 maxPrice 受限时，尝试用用户配置的上限重试
     if (
       v2Error.includes('NO_NUMBERS') &&
-      this.maxPrice > 0
+      this.maxPrice > 0 &&
+      effectiveMaxPrice > 0 &&
+      effectiveMaxPrice < this.maxPrice
     ) {
       try {
         const retryParams = { ...common };
-        // 用实际价格 3 倍为上限（参考项目逻辑）
         retryParams.maxPrice = String(this.maxPrice);
         const text = await this._requestText(retryParams, true);
         try {
@@ -691,6 +728,9 @@ export class HeroSmsProvider extends BaseSmsProvider {
         service,
         country,
       };
+      if (effectiveMaxPrice > 0) {
+        v1Params.maxPrice = String(effectiveMaxPrice);
+      }
       const text = await this._requestText(v1Params, true);
       if (text.startsWith('ACCESS_NUMBER:')) {
         const parts = text.split(':');
@@ -710,6 +750,10 @@ export class HeroSmsProvider extends BaseSmsProvider {
       }
       const msg = error instanceof Error ? error.message : String(error);
       if (msg.includes('NO_NUMBERS')) {
+        const priceLimitError = await this._buildPriceLimitError(service, country);
+        if (priceLimitError) {
+          throw priceLimitError;
+        }
         throw new TypedError('PROVIDER', 'NO_NUMBERS', '当前无可用号码', true, 30000);
       }
       throw new TypedError(
@@ -725,6 +769,121 @@ export class HeroSmsProvider extends BaseSmsProvider {
   // -------------------------------------------------------------------------
   // 内部方法：解析
   // -------------------------------------------------------------------------
+
+  /** 根据实时价格计算 getNumberV2 的 maxPrice；不限价时不再固定压到 1。 */
+  private async _resolveEffectiveMaxPrice(service: string, country: string): Promise<number> {
+    if (this.maxPrice > 0) {
+      return this.maxPrice;
+    }
+
+    try {
+      const availability = await this.getAvailability(service, country);
+      if (availability?.price !== null && availability?.price !== undefined) {
+        // 参考 any-auto-register：用实际价格 3 倍留出 FreePrice 浮动空间，最低 0.2。
+        return HeroSmsProvider._recommendedMaxPrice(availability.price);
+      }
+    } catch (error) {
+      console.warn('[HeroSmsProvider] 查询实时价格失败，getNumberV2 将不带 maxPrice:', error);
+    }
+
+    return 0;
+  }
+
+  /** 有库存却无号时，优先识别为价格上限过低，避免状态机盲目重试。 */
+  private async _buildPriceLimitError(service: string, country: string): Promise<TypedError | null> {
+    if (this.maxPrice <= 0) return null;
+
+    try {
+      const availability = await this.getAvailability(service, country);
+      if (!availability || availability.count <= 0 || availability.price === null) return null;
+
+      const recommendedMaxPrice = HeroSmsProvider._recommendedMaxPrice(availability.price);
+      if (this.maxPrice < recommendedMaxPrice) {
+        return new TypedError(
+          'PROVIDER',
+          'MAX_PRICE_TOO_LOW',
+          `当前国家 ${country} / 服务 ${service} 有库存 ${availability.count}，标价 $${availability.price.toFixed(4)}，但最大价格 $${this.maxPrice.toFixed(4)} 低于建议上限 $${recommendedMaxPrice.toFixed(4)}，实际租号可能被 HeroSMS 拒绝`,
+          false
+        );
+      }
+    } catch (error) {
+      console.warn('[HeroSmsProvider] 价格上限诊断失败:', error);
+    }
+
+    return null;
+  }
+
+  private static _recommendedMaxPrice(price: number): number {
+    return Math.max(Math.round(price * 3 * 10000) / 10000, 0.2);
+  }
+
+  /** 从 HeroSMS getPrices 的多种返回形态中提取指定国家/服务的价格库存。 */
+  private static _extractPriceInfo(
+    data: Record<string, unknown>,
+    service: string,
+    country: string
+  ): HeroSmsPriceInfo | null {
+    const roots = [
+      data,
+      HeroSmsProvider._asRecord(data.data),
+      HeroSmsProvider._asRecord(data.result),
+      HeroSmsProvider._asRecord(data.response),
+    ].filter((item): item is Record<string, unknown> => item !== null);
+
+    for (const root of roots) {
+      const countryEntry = HeroSmsProvider._asRecord(root[country]);
+      const serviceEntry = countryEntry ? HeroSmsProvider._asRecord(countryEntry[service]) : null;
+      const directServiceEntry = HeroSmsProvider._asRecord(root[service]);
+      const directEntry = HeroSmsProvider._looksLikePriceInfo(root) ? root : null;
+
+      const candidates = [serviceEntry, directServiceEntry, countryEntry, directEntry];
+      for (const candidate of candidates) {
+        if (!candidate || !HeroSmsProvider._looksLikePriceInfo(candidate)) continue;
+        return {
+          country,
+          service,
+          price: HeroSmsProvider._toNullableNumber(
+            candidate.cost ?? candidate.price ?? candidate.retail_price ?? candidate.retailPrice
+          ),
+          count: HeroSmsProvider._toCount(
+            candidate.count ?? candidate.qty ?? candidate.available ?? candidate.stock
+          ),
+        };
+      }
+    }
+
+    return null;
+  }
+
+  private static _looksLikePriceInfo(value: Record<string, unknown>): boolean {
+    return (
+      'cost' in value ||
+      'price' in value ||
+      'retail_price' in value ||
+      'retailPrice' in value ||
+      'count' in value ||
+      'qty' in value ||
+      'available' in value ||
+      'stock' in value
+    );
+  }
+
+  private static _asRecord(value: unknown): Record<string, unknown> | null {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : null;
+  }
+
+  private static _toNullableNumber(value: unknown): number | null {
+    if (value === null || value === undefined || value === '') return null;
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  }
+
+  private static _toCount(value: unknown): number {
+    const num = Number(value ?? 0);
+    return Number.isFinite(num) ? Math.max(0, Math.trunc(num)) : 0;
+  }
 
   /** 解析 V1 getStatus 纯文本响应 */
   private _parseStatusText(text: string): SmsCandidate {
@@ -753,11 +912,11 @@ export class HeroSmsProvider extends BaseSmsProvider {
 
   /** 格式化手机号：始终添加 "+" 前缀，尊重 countryPhoneCode */
   static _formatPhone(numberInfo: {
-    phoneNumber: string;
-    countryPhoneCode?: string;
+    phoneNumber: string | number;
+    countryPhoneCode?: string | number;
   }): string {
-    const raw = (numberInfo.phoneNumber || '').trim();
-    const countryPhoneCode = (numberInfo.countryPhoneCode || '').trim();
+    const raw = String(numberInfo.phoneNumber ?? '').trim();
+    const countryPhoneCode = String(numberInfo.countryPhoneCode ?? '').trim();
 
     if (raw.startsWith('+')) return raw;
     if (countryPhoneCode && raw.startsWith(countryPhoneCode)) return `+${raw}`;

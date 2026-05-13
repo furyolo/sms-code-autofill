@@ -10,9 +10,11 @@ export default defineConfig({
       'alarms',
       'notifications',
       'activeTab',
+      'tabs',
     ],
     host_permissions: [
       'https://hero-sms.com/*',
+      'https://auth.openai.com/*',
     ],
   },
   hooks: {

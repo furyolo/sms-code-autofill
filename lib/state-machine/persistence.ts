@@ -20,6 +20,7 @@ interface SerializedRetryState {
   bucketSize: number;
   currentActivationId: string | null;
   currentPhoneNumber: string | null;
+  currentActivationCountry: string | null;
   lastError: Record<string, unknown> | null;
   startedAt: number;
   lastTransitionAt: number;
@@ -49,6 +50,7 @@ export async function saveState(state: RetryState): Promise<void> {
     bucketSize: state.bucketSize,
     currentActivationId: state.currentActivationId,
     currentPhoneNumber: state.currentPhoneNumber,
+    currentActivationCountry: state.currentActivationCountry,
     lastError: state.lastError
       ? {
           name: state.lastError.name,
@@ -95,6 +97,7 @@ export async function loadState(): Promise<RetryState | null> {
       bucketSize: raw.bucketSize,
       currentActivationId: raw.currentActivationId,
       currentPhoneNumber: raw.currentPhoneNumber,
+      currentActivationCountry: raw.currentActivationCountry ?? null,
       lastError: raw.lastError
         ? ({
             name: raw.lastError.name || 'TypedError',
@@ -127,7 +130,7 @@ export async function loadState(): Promise<RetryState | null> {
  * Service Worker 恢复逻辑
  *
  * - WAIT_CODE: 重新注册 poll alarm
- * - AWAIT_CONFIRM: 检查通知是否存在，若无活跃通知自动转 STOPPED
+ * - AWAIT_CONFIRM: 保持暂停，用户可通过 Popup 或通知按钮继续/停止
  * - 其他 phase: 无动作（保持现状）
  *
  * @param state 恢复后的状态
@@ -147,32 +150,8 @@ export async function recoverState(
       break;
 
     case RetryPhase.AWAIT_CONFIRM:
-      // 检查通知是否仍存在
-      if (state.notificationId) {
-        try {
-          const stillAlive = await new Promise<boolean>((resolve) => {
-            chrome.notifications.getAll((notifications) => {
-              resolve(state.notificationId! in notifications);
-            });
-          });
-          if (!stillAlive) {
-            console.log('[Persistence] AWAIT_CONFIRM 通知已被系统清除，自动转为 STOPPED');
-            if (onTransition) {
-              await onTransition({ type: 'userStop' });
-            }
-          }
-        } catch {
-          // getAll 失败，保守转为 STOPPED
-          if (onTransition) {
-            await onTransition({ type: 'userStop' });
-          }
-        }
-      } else {
-        // 无 notificationId 记录，应该是异常状态，转为 STOPPED
-        if (onTransition) {
-          await onTransition({ type: 'userStop' });
-        }
-      }
+      // Popup 已提供继续/停止入口，系统通知只作为附加提醒；通知被系统清理时不应自动停止流程。
+      console.log('[Persistence] 恢复 AWAIT_CONFIRM，等待用户在 Popup 或通知中确认');
       break;
 
     default:

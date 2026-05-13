@@ -14,6 +14,7 @@
 export type C2B_Message =
   | { type: 'C2B_PAGE_READY'; tabId: number; url: string }
   | { type: 'C2B_PHONE_FILLED'; success: boolean; error?: string }
+  | { type: 'C2B_PHONE_REJECTED'; reason: string }
   | { type: 'C2B_CODE_DETECTED'; code: string }
   | { type: 'C2B_PAGE_CLOSED' };
 
@@ -23,7 +24,8 @@ export type C2B_Message =
 
 /** Service Worker 发送到 Content Script 的消息联合类型 */
 export type B2C_Message =
-  | { type: 'B2C_FILL_PHONE'; phoneNumber: string }
+  | { type: 'B2C_PREFLIGHT_FORM'; providerCountry?: string | null; providerCountryNames?: string[] | null }
+  | { type: 'B2C_FILL_PHONE'; phoneNumber: string; providerCountry?: string | null; providerCountryNames?: string[] | null }
   | { type: 'B2C_FILL_CODE'; code: string }
   | { type: 'B2C_STATUS_UPDATE'; phase: string; detail: string };
 

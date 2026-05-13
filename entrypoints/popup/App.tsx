@@ -95,14 +95,19 @@ function getStatusText(raw: RetryStateData): string {
     case 'WAIT_CODE':
       return '等待验证码...';
     case 'REJECTED':
-      return `重试中 (${attemptInBucket + 1}/${bucketSize})`;
+      return lastError?.message
+        ? `重试中 (${attemptInBucket}/${bucketSize})：${lastError.message}`
+        : `重试中 (${attemptInBucket}/${bucketSize})`;
     case 'BUCKET_EXHAUSTED':
     case 'AWAIT_CONFIRM':
-      return '等待确认';
+      return lastError?.message ? `等待确认：${lastError.message}` : '等待确认';
     case 'DONE':
       return `验证码已填入`;
     case 'STOPPED':
-      return '已停止';
+      if (lastError?.code === 'TARGET_PAGE_MISSING') {
+        return lastError.message || '等待目标页面...';
+      }
+      return lastError?.message ? `已停止：${lastError.message}` : '已停止';
     default:
       return lastError?.message || '未知错误';
   }
@@ -123,6 +128,15 @@ function isToggleOn(phase: string): boolean {
   }
 }
 
+function shouldKeepToggleOn(raw: RetryStateData): boolean {
+  return isToggleOn(raw.phase) || raw.lastError?.code === 'TARGET_PAGE_MISSING';
+}
+
+/** 判断当前是否需要用户在 Popup 中确认继续或停止 */
+function needsUserConfirmation(phase: string): boolean {
+  return phase === 'AWAIT_CONFIRM' || phase === 'BUCKET_EXHAUSTED';
+}
+
 /** 从原始 retry_state 数据计算 PopupState */
 function computePopupState(raw: RetryStateData | null): PopupState {
   if (!raw) {
@@ -139,7 +153,7 @@ function computePopupState(raw: RetryStateData | null): PopupState {
     originalPhase: phase,
     statusText: getStatusText(raw),
     dotColor: getStatusDotColor(phase),
-    toggleOn: isToggleOn(phase),
+    toggleOn: shouldKeepToggleOn(raw),
   };
 }
 
@@ -207,6 +221,16 @@ export default function App() {
     });
   }, [popupState.toggleOn]);
 
+  // 等待确认时的继续 / 停止处理
+  const handleConfirm = useCallback((action: 'continue' | 'stop') => {
+    chrome.runtime.sendMessage({
+      type: 'POPUP_CONFIRM',
+      action,
+    }).catch((err) => {
+      console.warn('[Popup] 确认消息发送失败:', err);
+    });
+  }, []);
+
   // 齿轮跳转 Options
   const handleOpenOptions = useCallback(() => {
     chrome.runtime.openOptionsPage();
@@ -259,6 +283,25 @@ export default function App() {
         />
         <span class="popup-status-text">${popupState.statusText}</span>
       </div>
+
+      ${needsUserConfirmation(popupState.originalPhase) && html`
+        <div class="popup-confirm-actions">
+          <button
+            class="popup-confirm-btn popup-confirm-btn--primary"
+            onClick=${() => handleConfirm('continue')}
+            type="button"
+          >
+            继续
+          </button>
+          <button
+            class="popup-confirm-btn"
+            onClick=${() => handleConfirm('stop')}
+            type="button"
+          >
+            停止
+          </button>
+        </div>
+      `}
     </div>
   `;
 }

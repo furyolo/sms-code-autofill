@@ -144,3 +144,38 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ===== 等待确认操作 ===== */
+.popup-confirm-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.popup-confirm-btn {
+  height: 28px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.popup-confirm-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.popup-confirm-btn--primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.popup-confirm-btn--primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}

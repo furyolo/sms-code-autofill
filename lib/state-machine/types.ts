@@ -5,6 +5,7 @@
  * 所有转换采用纯函数式 (RetryState, Event) => RetryState
  */
 import type { SmsActivation, TypedError } from '../providers/types';
+import type { CircuitBreakerResult, CircuitErrorType } from '../circuit-breaker';
 
 // ---------------------------------------------------------------------------
 // 枚举
@@ -36,7 +37,7 @@ export interface CircuitBreakerInfo {
 
 /** 断路器最小接口，F-008 实现时替换 */
 export interface CircuitBreaker {
-  recordError(error: TypedError): { tripped: boolean; info?: CircuitBreakerInfo };
+  recordError(errorType: CircuitErrorType): CircuitBreakerResult;
   reset(): void;
 }
 
@@ -82,6 +83,8 @@ export interface RetryState {
   currentActivationId: string | null;
   /** 当前手机号（含 "+" 前缀的国际格式） */
   currentPhoneNumber: string | null;
+  /** 当前激活对应的 HeroSMS 国家 ID（来自配置或 Provider 返回值） */
+  currentActivationCountry: string | null;
   /** 最近一次错误 */
   lastError: TypedError | null;
   /** 会话启动时间戳（Date.now()） */

@@ -19,20 +19,13 @@ import {
   findElementByStrategy,
 } from './selectors';
 
-// ---------------------------------------------------------------------------
-// 缓存 key
-// ---------------------------------------------------------------------------
-
-const SELECTOR_CACHE_KEY = 'selector_cache';
-
 interface SelectorCacheEntry {
   phoneStrategy?: string;
   codeStrategy?: string;
 }
 
-interface SelectorCache {
-  selector_cache?: SelectorCacheEntry;
-}
+/** Content Script 无法默认访问 chrome.storage.session，选择器缓存仅保留在当前页面会话内。 */
+const selectorCache: SelectorCacheEntry = {};
 
 // ---------------------------------------------------------------------------
 // React 合成事件注入
@@ -113,16 +106,12 @@ export function fillNativeInput(
 // 选择器缓存
 // ---------------------------------------------------------------------------
 
-/** 从 chrome.storage.session 读取选择器缓存 */
-async function getCachedStrategy(
+/** 从当前 Content Script 内存读取选择器缓存 */
+function getCachedStrategy(
   kind: 'phoneStrategy' | 'codeStrategy',
   strategies: SelectorStrategy[],
-): Promise<SelectorStrategy | null> {
-  const storage = (await chrome.storage.session.get(
-    SELECTOR_CACHE_KEY,
-  )) as SelectorCache;
-
-  const cachedName = storage.selector_cache?.[kind];
+): SelectorStrategy | null {
+  const cachedName = selectorCache[kind];
   if (!cachedName) return null;
 
   const strategy = strategies.find((s) => s.name === cachedName);
@@ -135,19 +124,12 @@ async function getCachedStrategy(
   return null; // 缓存失效
 }
 
-/** 将成功匹配的策略名写入 chrome.storage.session */
-async function cacheStrategy(
+/** 将成功匹配的策略名写入当前 Content Script 内存 */
+function cacheStrategy(
   kind: 'phoneStrategy' | 'codeStrategy',
   name: string,
-): Promise<void> {
-  const storage = (await chrome.storage.session.get(
-    SELECTOR_CACHE_KEY,
-  )) as SelectorCache;
-
-  const entry = storage.selector_cache ?? {};
-  entry[kind] = name;
-
-  await chrome.storage.session.set({ selector_cache: entry });
+): void {
+  selectorCache[kind] = name;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +145,7 @@ export async function getPhoneInput(): Promise<{
   strategy: SelectorStrategy;
 } | null> {
   // 1. 尝试缓存策略
-  const cached = await getCachedStrategy(
+  const cached = getCachedStrategy(
     'phoneStrategy',
     PHONE_SELECTOR_STRATEGIES,
   );
@@ -176,7 +158,7 @@ export async function getPhoneInput(): Promise<{
   for (const strategy of PHONE_SELECTOR_STRATEGIES) {
     const el = findElementByStrategy(strategy);
     if (el) {
-      await cacheStrategy('phoneStrategy', strategy.name);
+      cacheStrategy('phoneStrategy', strategy.name);
       return { element: el, strategy };
     }
   }
@@ -193,7 +175,7 @@ export async function getCodeInput(): Promise<{
   strategy: SelectorStrategy;
 } | null> {
   // 1. 尝试缓存策略
-  const cached = await getCachedStrategy(
+  const cached = getCachedStrategy(
     'codeStrategy',
     CODE_SELECTOR_STRATEGIES,
   );
@@ -206,7 +188,7 @@ export async function getCodeInput(): Promise<{
   for (const strategy of CODE_SELECTOR_STRATEGIES) {
     const el = findElementByStrategy(strategy);
     if (el) {
-      await cacheStrategy('codeStrategy', strategy.name);
+      cacheStrategy('codeStrategy', strategy.name);
       return { element: el, strategy };
     }
   }
