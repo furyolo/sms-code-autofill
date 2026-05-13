@@ -1,4 +1,5 @@
 import { HeroSmsProvider } from '../providers/hero-provider';
+import { calculateRecommendedMaxPrice } from '../providers/price';
 
 /**
  * 处理测试连接消息
@@ -42,7 +43,7 @@ export async function handleTestConnection(apiKey: string, overrides: TestConnec
     const availability = await provider.getAvailability(service, country);
     const price = availability?.price ?? null;
     const count = availability?.count ?? 0;
-    const recommendedMaxPrice = price === null ? null : Math.max(Math.round(price * 3 * 10000) / 10000, 0.2);
+    const recommendedMaxPrice = price === null ? null : calculateRecommendedMaxPrice(price);
     const priceBlocked = recommendedMaxPrice !== null && maxPrice > 0 && maxPrice < recommendedMaxPrice;
     return {
       success: true,

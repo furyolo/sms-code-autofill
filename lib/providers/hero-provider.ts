@@ -18,6 +18,7 @@ import {
   ProviderConfig,
 } from './types';
 import { BaseSmsProvider } from './base-provider';
+import { calculateRecommendedMaxPrice } from './price';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -779,7 +780,7 @@ export class HeroSmsProvider extends BaseSmsProvider {
     try {
       const availability = await this.getAvailability(service, country);
       if (availability?.price !== null && availability?.price !== undefined) {
-        // 参考 any-auto-register：用实际价格 3 倍留出 FreePrice 浮动空间，最低 0.2。
+        // 用实时市场价加少量缓冲，避免低价国家被固定高下限过度抬价。
         return HeroSmsProvider._recommendedMaxPrice(availability.price);
       }
     } catch (error) {
@@ -814,7 +815,7 @@ export class HeroSmsProvider extends BaseSmsProvider {
   }
 
   private static _recommendedMaxPrice(price: number): number {
-    return Math.max(Math.round(price * 3 * 10000) / 10000, 0.2);
+    return calculateRecommendedMaxPrice(price);
   }
 
   /** 从 HeroSMS getPrices 的多种返回形态中提取指定国家/服务的价格库存。 */

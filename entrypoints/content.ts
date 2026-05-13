@@ -531,10 +531,7 @@ function resolveTargetFromPageOptions(target: CountryTarget): CountryTarget | nu
   }
 
   const wantedNames = target.names.map(normalizeCountryText).filter(Boolean);
-  const matched = options.find((option) => {
-    const candidates = buildOptionNameCandidates(option);
-    return wantedNames.some((wanted) => candidates.some((candidate) => namesMatch(candidate, wanted)));
-  });
+  const matched = findBestCountryOption(options, wantedNames);
   if (!matched) {
     console.warn('[Content] 未能从页面国家列表反解目标国家:', {
       targetNames: target.names,
@@ -576,6 +573,27 @@ function buildOptionNameCandidates(option: HTMLOptionElement): string[] {
   ].map(normalizeCountryText).filter(Boolean);
 }
 
+function findBestCountryOption(
+  options: HTMLOptionElement[],
+  wantedNames: string[],
+): HTMLOptionElement | null {
+  let best: { option: HTMLOptionElement; score: number } | null = null;
+
+  for (const option of options) {
+    const candidates = buildOptionNameCandidates(option);
+    for (const candidate of candidates) {
+      for (const wanted of wantedNames) {
+        const score = countryNameMatchScore(candidate, wanted);
+        if (score > (best?.score ?? 0)) {
+          best = { option, score };
+        }
+      }
+    }
+  }
+
+  return best?.option ?? null;
+}
+
 function getIsoDisplayNames(isoCode: string): string[] {
   if (!/^[A-Z]{2}$/i.test(isoCode)) return [];
   const upper = isoCode.toUpperCase();
@@ -592,8 +610,36 @@ function getIsoDisplayNames(isoCode: string): string[] {
 }
 
 function namesMatch(left: string, right: string): boolean {
-  if (!left || !right) return false;
-  return left === right || left.includes(right) || right.includes(left);
+  return countryNameMatchScore(left, right) > 0;
+}
+
+function countryNameMatchScore(left: string, right: string): number {
+  if (!left || !right) return 0;
+  if (left === right) return 100;
+
+  // 中文只允许完整片段匹配，例如“印度尼西亚 (+62)”可匹配“印度尼西亚”，但“印度尼西亚”不会匹配“印度”。
+  if (hasCjk(left) || hasCjk(right)) {
+    if (isDelimitedPhraseMatch(left, right)) return 60;
+    if (isDelimitedPhraseMatch(right, left)) return 50;
+    return 0;
+  }
+
+  if (isDelimitedPhraseMatch(left, right)) return 60;
+  if (isDelimitedPhraseMatch(right, left)) return 50;
+  return 0;
+}
+
+function hasCjk(value: string): boolean {
+  return /[\u4e00-\u9fa5]/.test(value);
+}
+
+function isDelimitedPhraseMatch(haystack: string, needle: string): boolean {
+  if (hasCjk(needle)) {
+    return haystack.split(' ').includes(needle);
+  }
+  if (needle.length < 4 || needle.split(' ').length < 2) return false;
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^| )${escaped}( |$)`).test(haystack);
 }
 
 /** 模拟用户点击事件序列，React Aria 控件比原生 click 更依赖 pointer/mouse 事件。 */
@@ -663,7 +709,7 @@ function findCountryDropdownTrigger(): HTMLElement | null {
 
 /** 在下拉列表中查找国家选项候选。 */
 function findCountryOptions(target: CountryTarget): HTMLElement[] {
-  const names = target.names.map((name) => name.toLowerCase());
+  const names = target.names.map(normalizeCountryText).filter(Boolean);
   const result: HTMLElement[] = [];
 
   const candidates = document.querySelectorAll(
@@ -671,8 +717,8 @@ function findCountryOptions(target: CountryTarget): HTMLElement[] {
   );
 
   for (const el of candidates) {
-    const text = (el as HTMLElement).textContent?.toLowerCase() || '';
-    if (names.some((name) => text.includes(name))) {
+    const text = normalizeCountryText((el as HTMLElement).textContent || '');
+    if (names.some((name) => namesMatch(text, name))) {
       result.push(el as HTMLElement);
     }
   }
@@ -680,8 +726,8 @@ function findCountryOptions(target: CountryTarget): HTMLElement[] {
   // 回退：全页面搜索含国家名的可点击元素。
   const all = document.querySelectorAll('div, li, span, button');
   for (const el of all) {
-    const text = (el as HTMLElement).textContent?.trim().toLowerCase() || '';
-    if (names.some((name) => text === name || text.includes(name))) {
+    const text = normalizeCountryText((el as HTMLElement).textContent || '');
+    if (names.some((name) => namesMatch(text, name))) {
       const rect = el.getBoundingClientRect();
       // 只考虑可见的、在下拉区域内的元素
       if (rect.width > 0 && rect.height > 0 && rect.height < 60) {
