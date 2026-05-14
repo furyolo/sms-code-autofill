@@ -1,4 +1,4 @@
-import { CircuitBreaker, classifyError, DEFAULT_CIRCUIT_CONFIG } from '../lib/circuit-breaker';
+import { CircuitBreaker, classifyError, CircuitErrorType, DEFAULT_CIRCUIT_CONFIG } from '../lib/circuit-breaker';
 import { fillCodeAndSubmit, fillPhoneAndSubmit, preflightPhoneForm } from '../lib/content/page-automation';
 import { HeroSmsProvider } from '../lib/providers';
 import { TypedError, type ProviderConfig } from '../lib/providers/types';
@@ -233,12 +233,25 @@ export class UserscriptRuntime {
     await this.saveState();
 
     const config = await this.loadConfig();
-    const breaker = this.circuitBreaker.recordError(classifyError(error));
-    if (
-      this.state.attemptInBucket >= this.state.bucketSize ||
-      this.state.currentBucket >= this.state.maxBuckets ||
-      breaker.tripped
-    ) {
+    // 普通页面拒号不触发 UNKNOWN_REJECT=3 的断路器，避免 3 个号码后提前暂停。
+    const breaker = this.shouldUseCircuitBreaker(error)
+      ? this.circuitBreaker.recordError(classifyError(error))
+      : { tripped: false };
+    const bucketExhausted = this.state.attemptInBucket >= this.state.bucketSize;
+    const allBucketsExhausted = bucketExhausted && this.state.currentBucket >= this.state.maxBuckets;
+    if (bucketExhausted || breaker.tripped) {
+      if (allBucketsExhausted) {
+        this.stopped = true;
+        this.state.phase = RetryPhase.STOPPED;
+        await this.saveState();
+        this.render(`已停止：${error.message}`);
+        await this.platform.notification.notify({
+          title: 'SMS Code Autofill',
+          message: `已停止：共尝试 ${this.state.totalAttempts} 次，所有轮次已耗尽。`,
+        });
+        return;
+      }
+
       this.state.phase = RetryPhase.AWAIT_CONFIRM;
       await this.saveState();
       this.render(`暂停：${error.message}`);
@@ -255,6 +268,12 @@ export class UserscriptRuntime {
     this.state.phase = RetryPhase.GET_PHONE;
     await this.saveState();
     await this.getPhone(config);
+  }
+
+  /** 断路器只处理明确可分类的问题；普通拒号交给 Bucket 计数。 */
+  private shouldUseCircuitBreaker(error: TypedError): boolean {
+    if (error.code !== 'PHONE_REJECTED') return false;
+    return classifyError(error) !== CircuitErrorType.UNKNOWN_REJECT;
   }
 
   private async schedulePoll(): Promise<void> {
