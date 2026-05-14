@@ -19,6 +19,7 @@ import {
 } from './types';
 import { BaseSmsProvider } from './base-provider';
 import { calculateRecommendedMaxPrice } from './price';
+import { ChromeStorageAdapter, FetchHttpClient, type HttpClient, type StorageAdapter } from '../platform';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -85,6 +86,8 @@ export class HeroSmsProvider extends BaseSmsProvider {
   private resendCallback: (() => void) | null = null;
   private currentActivation: SmsActivation | null = null;
   private lastCodeResult: SmsCandidate | null = null;
+  private httpClient: HttpClient;
+  private storage: StorageAdapter;
 
   constructor(
     apiKey: string,
@@ -129,6 +132,8 @@ export class HeroSmsProvider extends BaseSmsProvider {
     this.proxy = config.proxy?.trim() || null;
     this.reusePhoneToMax = typeof config.reusePhoneToMax === 'boolean' ? config.reusePhoneToMax : true;
     this.phoneSuccessMax = typeof config.phoneSuccessMax === 'number' ? config.phoneSuccessMax : MAX_REUSE;
+    this.httpClient = config.httpClient ?? new FetchHttpClient();
+    this.storage = config.storage ?? new ChromeStorageAdapter(chrome.storage.session);
   }
 
   // -------------------------------------------------------------------------
@@ -579,7 +584,7 @@ export class HeroSmsProvider extends BaseSmsProvider {
   private async _request(
     params: Record<string, string>,
     timeout: number = 30
-  ): Promise<Response> {
+  ): Promise<{ ok: boolean; status: number; text: () => Promise<string> }> {
     const url = new URL(BASE_URL);
     const searchParams = new URLSearchParams();
     searchParams.set('api_key', this.apiKey);
@@ -588,15 +593,14 @@ export class HeroSmsProvider extends BaseSmsProvider {
     }
     url.search = searchParams.toString();
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeout * 1000);
-
     try {
-      const response = await fetch(url.toString(), {
-        signal: controller.signal,
+      const response = await this.httpClient.request<string>({
+        url: url.toString(),
+        responseType: 'text',
+        timeoutMs: timeout * 1000,
       });
 
-      if (!response.ok && response.status >= 500) {
+      if (response.status >= 500) {
         throw new TypedError(
           'API',
           `HTTP_${response.status}`,
@@ -605,7 +609,11 @@ export class HeroSmsProvider extends BaseSmsProvider {
           10000
         );
       }
-      return response;
+      return {
+        ok: response.status >= 200 && response.status < 300,
+        status: response.status,
+        text: async () => response.rawText,
+      };
     } catch (error: unknown) {
       if (error instanceof TypedError) throw error;
       if (error instanceof DOMException && error.name === 'AbortError') {
@@ -618,8 +626,6 @@ export class HeroSmsProvider extends BaseSmsProvider {
         true,
         5000
       );
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -946,7 +952,7 @@ export class HeroSmsProvider extends BaseSmsProvider {
     service: string,
     country: string
   ): Promise<HeroCache | null> {
-    const stored = await chrome.storage.session.get(CACHE_KEY);
+    const stored = await this.storage.get(CACHE_KEY);
     const cache = stored[CACHE_KEY] as HeroCache | undefined;
     if (!cache) return null;
 
@@ -980,17 +986,17 @@ export class HeroSmsProvider extends BaseSmsProvider {
 
   /** 保存缓存到 chrome.storage.session */
   private async _saveCache(cache: HeroCache): Promise<void> {
-    await chrome.storage.session.set({ [CACHE_KEY]: cache });
+    await this.storage.set({ [CACHE_KEY]: cache });
   }
 
   /** 清除缓存 */
   private async _clearCache(): Promise<void> {
-    await chrome.storage.session.remove(CACHE_KEY);
+    await this.storage.remove(CACHE_KEY);
   }
 
   /** 获取当前缓存（不做校验） */
   private async _getCache(): Promise<HeroCache | null> {
-    const stored = await chrome.storage.session.get(CACHE_KEY);
+    const stored = await this.storage.get(CACHE_KEY);
     return (stored[CACHE_KEY] as HeroCache) || null;
   }
 

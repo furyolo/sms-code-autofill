@@ -34,6 +34,8 @@ export class TypedError extends Error {
   }
 }
 
+import type { HttpClient, StorageAdapter } from '../platform';
+
 /** Provider 配置，从 chrome.storage.local 读取 */
 export interface ProviderConfig {
   apiKey: string;
@@ -43,6 +45,8 @@ export interface ProviderConfig {
   proxy?: string;
   reusePhoneToMax?: boolean;
   phoneSuccessMax?: number;
+  httpClient?: HttpClient;
+  storage?: StorageAdapter;
 }
 
 /** 号码缓存结构，存储于 chrome.storage.session */

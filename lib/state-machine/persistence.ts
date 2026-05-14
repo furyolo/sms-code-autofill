@@ -10,7 +10,7 @@ import { RetryPhase, RetryState } from './types';
 const STATE_KEY = 'retry_state';
 
 /** 序列化后的 RetryState（Sets → Arrays） */
-interface SerializedRetryState {
+export interface SerializedRetryState {
   phase: string;
   sessionId: string;
   currentBucket: number;
@@ -39,8 +39,8 @@ interface SerializedRetryState {
  * 将 RetryState 序列化并持久化到 chrome.storage.session
  * Sets 转换为 Arrays 以便 JSON 序列化
  */
-export async function saveState(state: RetryState): Promise<void> {
-  const serialized: SerializedRetryState = {
+export function serializeRetryState(state: RetryState): SerializedRetryState {
+  return {
     phase: state.phase,
     sessionId: state.sessionId,
     currentBucket: state.currentBucket,
@@ -73,8 +73,51 @@ export async function saveState(state: RetryState): Promise<void> {
     pollInterval: state.pollInterval,
     requestTimeout: state.requestTimeout,
   };
+}
 
+/**
+ * 将 RetryState 序列化并持久化到 chrome.storage.session
+ * Sets 转换为 Arrays 以便 JSON 序列化
+ */
+export async function saveState(state: RetryState): Promise<void> {
+  const serialized = serializeRetryState(state);
   await chrome.storage.session.set({ [STATE_KEY]: serialized });
+}
+
+export function deserializeRetryState(raw: SerializedRetryState): RetryState {
+  return {
+    phase: raw.phase as RetryPhase,
+    sessionId: raw.sessionId,
+    currentBucket: raw.currentBucket,
+    attemptInBucket: raw.attemptInBucket,
+    totalAttempts: raw.totalAttempts,
+    maxBuckets: raw.maxBuckets,
+    bucketSize: raw.bucketSize,
+    currentActivationId: raw.currentActivationId,
+    currentPhoneNumber: raw.currentPhoneNumber,
+    currentActivationCountry: raw.currentActivationCountry ?? null,
+    lastError: raw.lastError
+      ? ({
+          name: raw.lastError.name || 'TypedError',
+          category: raw.lastError.category,
+          code: raw.lastError.code,
+          message: raw.lastError.message,
+          recoverable: raw.lastError.recoverable,
+          retryAfterMs: raw.lastError.retryAfterMs,
+        } as RetryState['lastError'])
+      : null,
+    startedAt: raw.startedAt,
+    lastTransitionAt: raw.lastTransitionAt,
+    notificationId: raw.notificationId,
+    usedCodes: new Set(raw.usedCodes || []),
+    attemptedSmsKeys: new Set(raw.attemptedSmsKeys || []),
+    firstResendDone: raw.firstResendDone,
+    lastResendAt: raw.lastResendAt,
+    pauseMode: raw.pauseMode as RetryState['pauseMode'],
+    costPerAttempt: raw.costPerAttempt,
+    pollInterval: raw.pollInterval,
+    requestTimeout: raw.requestTimeout,
+  };
 }
 
 /**
@@ -87,39 +130,7 @@ export async function loadState(): Promise<RetryState | null> {
     const raw = result[STATE_KEY] as SerializedRetryState | undefined;
     if (!raw) return null;
 
-    return {
-      phase: raw.phase as RetryPhase,
-      sessionId: raw.sessionId,
-      currentBucket: raw.currentBucket,
-      attemptInBucket: raw.attemptInBucket,
-      totalAttempts: raw.totalAttempts,
-      maxBuckets: raw.maxBuckets,
-      bucketSize: raw.bucketSize,
-      currentActivationId: raw.currentActivationId,
-      currentPhoneNumber: raw.currentPhoneNumber,
-      currentActivationCountry: raw.currentActivationCountry ?? null,
-      lastError: raw.lastError
-        ? ({
-            name: raw.lastError.name || 'TypedError',
-            category: raw.lastError.category,
-            code: raw.lastError.code,
-            message: raw.lastError.message,
-            recoverable: raw.lastError.recoverable,
-            retryAfterMs: raw.lastError.retryAfterMs,
-          } as RetryState['lastError'])
-        : null,
-      startedAt: raw.startedAt,
-      lastTransitionAt: raw.lastTransitionAt,
-      notificationId: raw.notificationId,
-      usedCodes: new Set(raw.usedCodes || []),
-      attemptedSmsKeys: new Set(raw.attemptedSmsKeys || []),
-      firstResendDone: raw.firstResendDone,
-      lastResendAt: raw.lastResendAt,
-      pauseMode: raw.pauseMode as RetryState['pauseMode'],
-      costPerAttempt: raw.costPerAttempt,
-      pollInterval: raw.pollInterval,
-      requestTimeout: raw.requestTimeout,
-    };
+    return deserializeRetryState(raw);
   } catch {
     console.warn('[Persistence] 加载状态失败，返回 null');
     return null;

@@ -12,17 +12,18 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
-    "ignoreDeprecations": "5.0",
+    "ignoreDeprecations": "6.0",
+    "types": ["chrome"],
     "paths": {
       "@/*": ["./*"]
-    },
-    "baseUrl": "."
+    }
   },
   "include": [
     "entrypoints/**/*.ts",
     "entrypoints/**/*.tsx",
     "lib/**/*.ts",
     "lib/**/*.tsx",
+    "userscript/**/*.ts",
     "wxt.config.ts"
   ],
   "exclude": [
