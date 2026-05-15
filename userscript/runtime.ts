@@ -121,6 +121,12 @@ export class UserscriptRuntime {
 
   async continueAfterPause(): Promise<void> {
     if (this.state.phase !== RetryPhase.AWAIT_CONFIRM) return;
+    const preflight = await preflightPhoneForm();
+    if (!preflight.success) {
+      this.render(`仍在暂停：请先回到手机号输入页（${preflight.error}）`);
+      return;
+    }
+
     this.state.currentBucket += 1;
     this.state.attemptInBucket = 0;
     this.state.phase = RetryPhase.GET_PHONE;
@@ -186,7 +192,7 @@ export class UserscriptRuntime {
     if (!this.provider || this.stopped || this.state.phase !== RetryPhase.WAIT_CODE || !this.state.currentActivationId) return;
     const elapsed = Date.now() - this.state.startedAt;
     if (elapsed >= this.state.requestTimeout) {
-      await this.handleRejected(new TypedError('PROVIDER', 'CODE_TIMEOUT', '等待验证码超时', true));
+      await this.handleCodeTimeout();
       return;
     }
 
@@ -214,6 +220,47 @@ export class UserscriptRuntime {
 
     this.render(this.describePhase());
     await this.schedulePoll();
+  }
+
+  /** 验证码等待超时表示页面已进入验证码输入态，不能直接换号重填手机号。 */
+  private async handleCodeTimeout(): Promise<void> {
+    const error = new TypedError('PROVIDER', 'CODE_TIMEOUT', '等待验证码超时', true);
+    if (this.state.currentActivationId && this.provider) {
+      try {
+        await this.provider.cancel(this.state.currentActivationId);
+      } catch {
+        // 忽略取消失败，避免卡住暂停态。
+      }
+    }
+
+    this.state.attemptInBucket += 1;
+    this.state.totalAttempts += 1;
+    this.state.currentActivationId = null;
+    this.state.currentPhoneNumber = null;
+    this.state.currentActivationCountry = null;
+    this.state.lastError = error;
+    if (this.state.currentBucket >= this.state.maxBuckets) {
+      this.stopped = true;
+      this.state.phase = RetryPhase.STOPPED;
+      this.state.lastTransitionAt = Date.now();
+      await this.saveState();
+      this.render('已停止：等待验证码超时');
+      await this.platform.notification.notify({
+        title: 'SMS Code Autofill',
+        message: `已停止：共尝试 ${this.state.totalAttempts} 次，所有轮次已耗尽。`,
+      });
+      return;
+    }
+
+    this.state.phase = RetryPhase.AWAIT_CONFIRM;
+    this.state.lastTransitionAt = Date.now();
+    await this.saveState();
+    this.render('暂停：等待验证码超时，请回到手机号输入页后继续');
+    await this.platform.notification.notify({
+      title: 'SMS Code Autofill',
+      message: '等待验证码超时。请回到手机号输入页后点击继续，脚本不会在验证码页自动换号。',
+      requireInteraction: true,
+    });
   }
 
   private async handleRejected(error: TypedError): Promise<void> {
