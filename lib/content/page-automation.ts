@@ -464,7 +464,7 @@ function isDelimitedPhraseMatch(haystack: string, needle: string): boolean {
 function dispatchUserClick(element: HTMLElement): void {
   element.focus();
   for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
-    const eventInit = { bubbles: true, cancelable: true, view: window };
+    const eventInit = { bubbles: true, cancelable: true };
     const event = type.startsWith('pointer') && typeof PointerEvent !== 'undefined'
       ? new PointerEvent(type, eventInit)
       : new MouseEvent(type, eventInit);

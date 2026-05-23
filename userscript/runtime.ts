@@ -1,11 +1,27 @@
 import { CircuitBreaker, classifyError, CircuitErrorType, DEFAULT_CIRCUIT_CONFIG } from '../lib/circuit-breaker';
 import { fillCodeAndSubmit, fillPhoneAndSubmit, preflightPhoneForm } from '../lib/content/page-automation';
+import {
+  detectRegistrationPageKind,
+  fillEmailCodeAndSubmit,
+  fillProfileAndSubmit,
+  fillSignupEmailAndSubmit,
+  waitForSignupEntryState,
+  waitForRegistrationPageChange,
+  type IdentityProfile,
+} from '../lib/content/registration-automation';
 import { HeroSmsProvider } from '../lib/providers';
 import { TypedError, type ProviderConfig } from '../lib/providers/types';
 import { RetryPhase, type RetryState } from '../lib/state-machine';
 import { serializeRetryState, deserializeRetryState, type SerializedRetryState } from '../lib/state-machine/persistence';
 import type { PlatformAdapter } from '../lib/platform';
 import { UserscriptPanel } from './panel';
+import {
+  CloudflareTempEmailProvider,
+  normalizeBaseUrl,
+  normalizeDomain,
+  normalizeEmailLocalPart,
+  type CloudflareTempEmailAccount,
+} from './cloudflare-temp-email';
 
 interface UserscriptConfig {
   apiKey: string;
@@ -17,6 +33,11 @@ interface UserscriptConfig {
   maxBuckets: number;
   pollInterval: number;
   requestTimeout: number;
+  cloudflareTempEmailBaseUrl: string;
+  cloudflareTempEmailAdminAuth: string;
+  cloudflareTempEmailDomain: string;
+  emailPollInterval: number;
+  emailRequestTimeout: number;
 }
 
 interface HeroCountryOption {
@@ -27,6 +48,8 @@ interface HeroCountryOption {
 
 const CONFIG_KEY = 'userscript_config';
 const STATE_KEY = 'retry_state';
+const EMAIL_STATE_KEY = 'registration_email_state';
+const EMAIL_RUNNING_KEY = 'registration_email_running';
 const POLL_TIMER = 'poll-code';
 const HERO_COUNTRIES_URL = 'https://hero-sms.com/stubs/handler_api.php?action=getCountries';
 
@@ -40,18 +63,36 @@ const DEFAULT_CONFIG: UserscriptConfig = {
   maxBuckets: 3,
   pollInterval: 5000,
   requestTimeout: 120000,
+  cloudflareTempEmailBaseUrl: '',
+  cloudflareTempEmailAdminAuth: '',
+  cloudflareTempEmailDomain: '',
+  emailPollInterval: 3000,
+  emailRequestTimeout: 120000,
 };
+
+interface RegistrationEmailState {
+  email: string;
+  localPart: string;
+  firstName: string;
+  lastName: string;
+  age: number;
+  usedCodes: string[];
+  beforeEmailIds: string[];
+}
 
 export class UserscriptRuntime {
   private state: RetryState = this.createInitialState();
   private provider: HeroSmsProvider | null = null;
+  private emailProvider: CloudflareTempEmailProvider | null = null;
+  private emailState: RegistrationEmailState | null = null;
+  private emailRegistrationActive = false;
   private readonly circuitBreaker = new CircuitBreaker({ ...DEFAULT_CIRCUIT_CONFIG });
   private readonly panel: UserscriptPanel;
   private stopped = false;
 
   constructor(private readonly platform: PlatformAdapter) {
     this.panel = new UserscriptPanel({
-      start: () => void this.start(),
+      start: () => void this.startWithErrorBoundary(),
       stop: () => void this.stop(),
       continue: () => void this.continueAfterPause(),
       openSettings: () => void this.openSettings(),
@@ -69,10 +110,62 @@ export class UserscriptRuntime {
       }
       this.render(this.describePhase());
     }
+
+    const emailSaved = await this.platform.sessionStorage.get(EMAIL_STATE_KEY);
+    const localEmailSaved = await this.platform.localStorage.get(EMAIL_STATE_KEY);
+    const rawEmailState = (emailSaved[EMAIL_STATE_KEY] || localEmailSaved[EMAIL_STATE_KEY]) as RegistrationEmailState | undefined;
+    if (rawEmailState?.email) {
+      this.emailState = rawEmailState;
+      this.render(this.describePhase());
+    }
+
+    const runningSaved = await this.platform.sessionStorage.get(EMAIL_RUNNING_KEY);
+    const pageKind = detectRegistrationPageKind();
+    if ((pageKind === 'add_phone' || pageKind === 'complete') && this.emailState?.email) {
+      await this.clearEmailState();
+      await this.saveEmailRunning(false);
+    }
+    if (pageKind === 'email_otp' && !this.emailState?.email) {
+      this.render('邮箱验证码页缺少邮箱状态，请回到邮箱页重新启动');
+      return;
+    }
+    if (this.shouldResumeEmailRegistration(pageKind, runningSaved[EMAIL_RUNNING_KEY] === true)) {
+      void this.resumeEmailRegistrationAfterNavigation();
+    }
+  }
+
+  private async startWithErrorBoundary(): Promise<void> {
+    try {
+      this.render('启动中');
+      await this.start();
+    } catch (error) {
+      console.error('[Userscript] 启动失败:', error);
+      this.render(`启动失败：${errorMessage(error)}`);
+    }
   }
 
   async start(): Promise<void> {
     const config = await this.loadConfig();
+    this.stopped = false;
+
+    let pageKind = detectRegistrationPageKind();
+
+    if (pageKind !== 'add_phone') {
+      this.emailRegistrationActive = true;
+      await this.saveEmailRunning(true);
+      const registrationResult = await this.runEmailRegistration(config, pageKind);
+      if (!registrationResult.success) {
+        if (isEmailRegistrationPending(registrationResult.error)) return;
+        this.emailRegistrationActive = false;
+        await this.saveEmailRunning(false);
+        this.render(`注册邮箱阶段失败：${registrationResult.error}`);
+        return;
+      }
+      this.emailRegistrationActive = false;
+      await this.saveEmailRunning(false);
+      await this.clearEmailState();
+    }
+
     if (!config.apiKey.trim()) {
       this.render('请先配置 HeroSMS API Key');
       await this.openSettings();
@@ -85,7 +178,6 @@ export class UserscriptRuntime {
       return;
     }
 
-    this.stopped = false;
     this.provider = this.createProvider(config);
     this.state = {
       ...this.createInitialState(),
@@ -116,7 +208,41 @@ export class UserscriptRuntime {
     this.state.phase = RetryPhase.STOPPED;
     this.state.lastTransitionAt = Date.now();
     await this.saveState();
+    await this.saveEmailRunning(false);
     this.render('已停止');
+  }
+
+  private async resumeEmailRegistrationAfterNavigation(): Promise<void> {
+    try {
+      this.emailRegistrationActive = true;
+      this.render('继续邮箱注册');
+      const config = await this.loadConfig();
+      const registrationResult = await this.runEmailRegistration(config, detectRegistrationPageKind());
+      if (!registrationResult.success) {
+        if (isEmailRegistrationPending(registrationResult.error)) return;
+        this.emailRegistrationActive = false;
+        await this.saveEmailRunning(false);
+        this.render(`注册邮箱阶段失败：${registrationResult.error}`);
+        return;
+      }
+      this.emailRegistrationActive = false;
+      await this.saveEmailRunning(false);
+      await this.clearEmailState();
+      await this.start();
+    } catch (error) {
+      this.emailRegistrationActive = false;
+      console.error('[Userscript] 恢复邮箱注册失败:', error);
+      this.render(`恢复邮箱注册失败：${errorMessage(error)}`);
+    }
+  }
+
+  private shouldResumeEmailRegistration(
+    pageKind: ReturnType<typeof detectRegistrationPageKind>,
+    running: boolean,
+  ): boolean {
+    if (pageKind === 'complete') return false;
+    if (running) return true;
+    return Boolean(this.emailState?.email && ['email_otp', 'about_you'].includes(pageKind));
   }
 
   async continueAfterPause(): Promise<void> {
@@ -136,6 +262,92 @@ export class UserscriptRuntime {
     const config = await this.loadConfig();
     this.provider = this.createProvider(config);
     await this.getPhone(config);
+  }
+
+  private async runEmailRegistration(
+    config: UserscriptConfig,
+    initialPageKind = detectRegistrationPageKind(),
+  ): Promise<{ success: boolean; error?: string }> {
+    if (initialPageKind === 'complete') return { success: true };
+    if (!config.cloudflareTempEmailBaseUrl.trim() || !config.cloudflareTempEmailDomain.trim()) {
+      await this.openSettings();
+      return { success: false, error: '请先配置 Cloudflare Temp Email Base URL 和域名' };
+    }
+
+    this.emailProvider = this.createEmailProvider(config);
+    let pageKind: ReturnType<typeof detectRegistrationPageKind> = initialPageKind;
+
+    if (pageKind === 'home' || pageKind === 'unknown') {
+      this.render('识别注册入口');
+      const entryState = await waitForSignupEntryState({
+        timeout: 20000,
+        autoOpenEntry: true,
+      });
+      if (entryState.state === 'email_entry') {
+        pageKind = 'email';
+      } else if (entryState.state === 'phone_entry') {
+        pageKind = 'unknown';
+      } else if (entryState.state === 'password_page') {
+        pageKind = 'complete';
+      } else {
+        pageKind = detectRegistrationPageKind();
+      }
+    }
+
+    if (pageKind === 'email' || pageKind === 'unknown') {
+      this.render('创建临时邮箱');
+      const account = await this.ensureRegistrationEmail();
+      this.render('填入邮箱');
+      await this.recordEmailSubmitBaseline(account.email);
+      const filled = await fillSignupEmailAndSubmit(account.email);
+      if (!filled.success) return filled;
+      return { success: false, error: 'EMAIL_VERIFICATION_PAGE_PENDING' };
+    }
+
+    if (pageKind === 'email_otp') {
+      const emailState = this.emailState;
+      const emailProvider = this.emailProvider;
+      if (!emailState?.email || !emailProvider) return { success: false, error: 'EMAIL_STATE_MISSING' };
+      this.render('等待邮箱验证码');
+      const code = await emailProvider.waitForCode(emailState.email, new Set(emailState.usedCodes), {
+        beforeIds: new Set(emailState.beforeEmailIds || []),
+      });
+      if (!code) return { success: false, error: 'EMAIL_CODE_TIMEOUT' };
+      emailState.usedCodes.push(code);
+      this.emailState = emailState;
+      await this.saveEmailState();
+      const filled = await fillEmailCodeAndSubmit(code);
+      if (!filled.success) return filled;
+      pageKind = await waitForRegistrationPageChange(pageKind);
+    }
+
+    if (pageKind === 'about_you') {
+      const profile = this.profileFromEmailState();
+      if (!profile) return { success: false, error: 'PROFILE_STATE_MISSING' };
+      this.render(`填写资料 ${profile.firstName} ${profile.lastName} ${profile.age}`);
+      const filled = await fillProfileAndSubmit(profile);
+      if (!filled.success) return filled;
+      await this.clearEmailState();
+      await this.saveEmailRunning(false);
+      pageKind = await waitForRegistrationPageChange(pageKind);
+    }
+
+    if (pageKind === 'email' || pageKind === 'email_otp') {
+      this.render('邮箱注册流程进行中');
+      return { success: false, error: 'EMAIL_REGISTRATION_IN_PROGRESS' };
+    }
+
+    if (pageKind === 'unknown' && this.emailState?.email) {
+      this.render('邮箱注册流程进行中');
+      return { success: false, error: 'EMAIL_REGISTRATION_IN_PROGRESS' };
+    }
+
+    if (pageKind === 'add_phone' || pageKind === 'complete') {
+      await this.clearEmailState();
+      return { success: true };
+    }
+
+    return { success: false, error: `UNSUPPORTED_REGISTRATION_PAGE_${pageKind}` };
   }
 
   async openSettings(): Promise<void> {
@@ -341,6 +553,66 @@ export class UserscriptRuntime {
     return new HeroSmsProvider(config.apiKey, providerConfig);
   }
 
+  private createEmailProvider(config: UserscriptConfig): CloudflareTempEmailProvider {
+    return new CloudflareTempEmailProvider(this.platform.http, {
+      baseUrl: config.cloudflareTempEmailBaseUrl,
+      adminAuth: config.cloudflareTempEmailAdminAuth,
+      domain: config.cloudflareTempEmailDomain,
+      pollInterval: config.emailPollInterval,
+      requestTimeout: config.emailRequestTimeout,
+    });
+  }
+
+  private async ensureRegistrationEmail(): Promise<CloudflareTempEmailAccount> {
+    if (this.emailState?.email) {
+      return {
+        email: this.emailState.email,
+        localPart: this.emailState.localPart,
+        domain: this.emailState.email.split('@')[1] ?? '',
+      };
+    }
+    if (!this.emailProvider) throw new Error('Cloudflare Temp Email Provider 未初始化');
+
+    const profile = generateIdentityProfile();
+    const localPart = normalizeEmailLocalPart(`${profile.firstName}${profile.lastName}${profile.age}`);
+    const account = await this.emailProvider.createEmail(localPart);
+    this.emailState = {
+      email: account.email,
+      localPart: account.localPart,
+      firstName: profile.firstName,
+      lastName: profile.lastName,
+      age: profile.age,
+      usedCodes: [],
+      beforeEmailIds: [],
+    };
+    await this.saveEmailState();
+    return account;
+  }
+
+  private async recordEmailSubmitBaseline(email: string): Promise<void> {
+    if (!this.emailState || !this.emailProvider) return;
+    let beforeEmailIds: string[] = [];
+    try {
+      beforeEmailIds = Array.from(await this.emailProvider.getCurrentIds(email));
+    } catch (error) {
+      console.warn('[Userscript] 记录提交前邮件基线失败，将仅使用时间过滤:', error);
+    }
+    this.emailState = {
+      ...this.emailState,
+      beforeEmailIds,
+    };
+    await this.saveEmailState();
+  }
+
+  private profileFromEmailState(): IdentityProfile | null {
+    if (!this.emailState) return null;
+    return {
+      firstName: this.emailState.firstName,
+      lastName: this.emailState.lastName,
+      age: this.emailState.age,
+    };
+  }
+
   private async loadConfig(): Promise<UserscriptConfig> {
     const data = await this.platform.localStorage.get({ [CONFIG_KEY]: DEFAULT_CONFIG });
     const raw = data[CONFIG_KEY] as Partial<UserscriptConfig> | undefined;
@@ -348,6 +620,8 @@ export class UserscriptRuntime {
       ...DEFAULT_CONFIG,
       ...raw,
       countryNames: Array.isArray(raw?.countryNames) ? raw.countryNames : DEFAULT_CONFIG.countryNames,
+      cloudflareTempEmailBaseUrl: normalizeBaseUrl(String(raw?.cloudflareTempEmailBaseUrl ?? DEFAULT_CONFIG.cloudflareTempEmailBaseUrl)),
+      cloudflareTempEmailDomain: normalizeDomain(String(raw?.cloudflareTempEmailDomain ?? DEFAULT_CONFIG.cloudflareTempEmailDomain)),
     };
   }
 
@@ -446,6 +720,17 @@ export class UserscriptRuntime {
             margin: 0 0 12px;
             font-size: 15px;
           }
+          #sms-code-autofill-userscript-settings fieldset {
+            margin: 12px 0;
+            padding: 12px;
+            border: 1px solid #e4e4e7;
+            border-radius: 8px;
+          }
+          #sms-code-autofill-userscript-settings legend {
+            padding: 0 6px;
+            color: #27272a;
+            font-weight: 650;
+          }
           #sms-code-autofill-userscript-settings label {
             display: grid;
             gap: 5px;
@@ -534,25 +819,44 @@ export class UserscriptRuntime {
         </style>
         <form>
           <h2>SMS Code Autofill 设置</h2>
-          <label>
-            API Key
-            <input name="apiKey" autocomplete="off" />
-          </label>
-          <label>
-            默认国家
-            <span class="sms-current-country" data-role="current-country">
-              <span data-role="current-country-label"></span>
-              <button type="button" class="sms-country-clear" data-action="clear-country" title="重新选择国家">×</button>
-            </span>
-            <input name="country" autocomplete="off" placeholder="输入国家名或 ID 搜索" />
-            <span class="sms-country-status" data-role="country-status"></span>
-            <div class="sms-country-list" data-role="country-list"></div>
-          </label>
-          <label>
-            最大价格
-            <input name="maxPrice" type="number" min="-1" step="0.01" />
-          </label>
+          <fieldset>
+            <legend>Cloudflare 邮箱设置</legend>
+            <label>
+              Cloudflare Temp Email Base URL
+              <input name="cloudflareTempEmailBaseUrl" autocomplete="off" placeholder="https://temp.example.com" />
+            </label>
+            <label>
+              Cloudflare Temp Email 域名
+              <input name="cloudflareTempEmailDomain" autocomplete="off" placeholder="mail.example.com" />
+            </label>
+            <label>
+              Cloudflare Admin Auth
+              <input name="cloudflareTempEmailAdminAuth" autocomplete="off" />
+            </label>
+          </fieldset>
+          <fieldset>
+            <legend>SMS 手机号设置</legend>
+            <label>
+              API Key
+              <input name="apiKey" autocomplete="off" />
+            </label>
+            <label>
+              默认国家
+              <span class="sms-current-country" data-role="current-country">
+                <span data-role="current-country-label"></span>
+                <button type="button" class="sms-country-clear" data-action="clear-country" title="重新选择国家">×</button>
+              </span>
+              <input name="country" autocomplete="off" placeholder="输入国家名或 ID 搜索" />
+              <span class="sms-country-status" data-role="country-status"></span>
+              <div class="sms-country-list" data-role="country-list"></div>
+            </label>
+            <label>
+              最大价格
+              <input name="maxPrice" type="number" min="-1" step="0.01" />
+            </label>
+          </fieldset>
           <div class="sms-actions">
+            <button type="button" data-action="clear-email">清除邮箱</button>
             <button type="button" data-action="cancel">取消</button>
             <button type="submit" data-primary="true">保存</button>
           </div>
@@ -563,6 +867,9 @@ export class UserscriptRuntime {
       const apiKeyInput = form.elements.namedItem('apiKey') as HTMLInputElement;
       const countryInput = form.elements.namedItem('country') as HTMLInputElement;
       const maxPriceInput = form.elements.namedItem('maxPrice') as HTMLInputElement;
+      const cloudflareBaseUrlInput = form.elements.namedItem('cloudflareTempEmailBaseUrl') as HTMLInputElement;
+      const cloudflareDomainInput = form.elements.namedItem('cloudflareTempEmailDomain') as HTMLInputElement;
+      const cloudflareAdminAuthInput = form.elements.namedItem('cloudflareTempEmailAdminAuth') as HTMLInputElement;
       const currentCountryEl = root.querySelector('[data-role="current-country"]') as HTMLElement;
       const currentCountryLabelEl = root.querySelector('[data-role="current-country-label"]') as HTMLElement;
       const countryStatusEl = root.querySelector('[data-role="country-status"]') as HTMLElement;
@@ -572,6 +879,9 @@ export class UserscriptRuntime {
       let selectingCountry = false;
 
       apiKeyInput.value = current.apiKey;
+      cloudflareBaseUrlInput.value = current.cloudflareTempEmailBaseUrl;
+      cloudflareDomainInput.value = current.cloudflareTempEmailDomain;
+      cloudflareAdminAuthInput.value = current.cloudflareTempEmailAdminAuth;
       countryStatusEl.textContent = countriesPromise ? '正在加载国家列表...' : '';
       maxPriceInput.value = String(current.maxPrice);
 
@@ -624,6 +934,11 @@ export class UserscriptRuntime {
         resolve(value);
       };
 
+      root.querySelector('[data-action="clear-email"]')?.addEventListener('click', async () => {
+        await this.clearEmailState();
+        await this.saveEmailRunning(false);
+        this.render('已清除注册邮箱状态');
+      });
       root.querySelector('[data-action="cancel"]')?.addEventListener('click', () => close(null));
       clearCountryButton.addEventListener('click', () => {
         selectedCountry = null;
@@ -643,6 +958,9 @@ export class UserscriptRuntime {
           countryNames: country.names,
           service: DEFAULT_CONFIG.service,
           maxPrice: parseMaxPrice(maxPriceInput.value, current.maxPrice),
+          cloudflareTempEmailBaseUrl: normalizeBaseUrl(cloudflareBaseUrlInput.value),
+          cloudflareTempEmailDomain: normalizeDomain(cloudflareDomainInput.value),
+          cloudflareTempEmailAdminAuth: cloudflareAdminAuthInput.value.trim(),
         });
       });
 
@@ -687,6 +1005,29 @@ export class UserscriptRuntime {
     await this.platform.sessionStorage.set({ [STATE_KEY]: serializeRetryState(this.state) });
   }
 
+  private async saveEmailState(): Promise<void> {
+    await Promise.all([
+      this.platform.sessionStorage.set({ [EMAIL_STATE_KEY]: this.emailState }),
+      this.platform.localStorage.set({ [EMAIL_STATE_KEY]: this.emailState }),
+    ]);
+  }
+
+  private async clearEmailState(): Promise<void> {
+    this.emailState = null;
+    await Promise.all([
+      this.platform.sessionStorage.remove(EMAIL_STATE_KEY),
+      this.platform.localStorage.remove(EMAIL_STATE_KEY),
+    ]);
+  }
+
+  private async saveEmailRunning(running: boolean): Promise<void> {
+    if (running) {
+      await this.platform.sessionStorage.set({ [EMAIL_RUNNING_KEY]: true });
+      return;
+    }
+    await this.platform.sessionStorage.remove(EMAIL_RUNNING_KEY);
+  }
+
   private createInitialState(): RetryState {
     return {
       phase: RetryPhase.IDLE,
@@ -725,13 +1066,76 @@ export class UserscriptRuntime {
   private render(statusText: string): void {
     this.panel.update({
       phase: this.state.phase,
+      mode: this.panelMode(),
       statusText,
       attemptText: `${this.state.attemptInBucket}/${this.state.bucketSize} 轮次 ${this.state.currentBucket}/${this.state.maxBuckets}`,
+      emailText: this.emailState?.email ?? '-',
       phoneText: this.state.currentPhoneNumber ? maskPhone(this.state.currentPhoneNumber) : '-',
       canContinue: this.state.phase === RetryPhase.AWAIT_CONFIRM,
-      running: ![RetryPhase.IDLE, RetryPhase.STOPPED, RetryPhase.DONE].includes(this.state.phase),
+      running: this.emailRegistrationActive || ![RetryPhase.IDLE, RetryPhase.STOPPED, RetryPhase.DONE].includes(this.state.phase),
     });
   }
+
+  private panelMode(): 'cloudflare' | 'sms' | 'idle' {
+    if (this.emailRegistrationActive || this.emailState?.email) return 'cloudflare';
+    if (![RetryPhase.IDLE, RetryPhase.STOPPED, RetryPhase.DONE].includes(this.state.phase)) return 'sms';
+    return 'idle';
+  }
+}
+
+const FIRST_NAMES = [
+  'Aaliyah', 'Aaron', 'Abigail', 'Adam', 'Adrian', 'Aiden', 'Alexa', 'Alice',
+  'Allison', 'Amelia', 'Andrew', 'Anna', 'Anthony', 'Aria', 'Arthur', 'Audrey',
+  'Aurora', 'Austin', 'Ava', 'Avery', 'Bella', 'Benjamin', 'Blake', 'Brandon',
+  'Brianna', 'Brooklyn', 'Caleb', 'Cameron', 'Caroline', 'Charles', 'Charlotte',
+  'Chloe', 'Claire', 'Connor', 'Daniel', 'David', 'Dylan', 'Eleanor', 'Elena',
+  'Eli', 'Elijah', 'Elizabeth', 'Ella', 'Emily', 'Emma', 'Ethan', 'Eva',
+  'Evelyn', 'Ezra', 'Gabriel', 'Grace', 'Grayson', 'Hannah', 'Harper', 'Hazel',
+  'Henry', 'Hudson', 'Hunter', 'Isaac', 'Isabella', 'Jack', 'Jackson', 'Jacob',
+  'James', 'Jasmine', 'Jayden', 'John', 'Joseph', 'Joshua', 'Julia', 'Julian',
+  'Katherine', 'Kayla', 'Kennedy', 'Kevin', 'Landon', 'Layla', 'Leah', 'Leo',
+  'Levi', 'Liam', 'Lily', 'Logan', 'Lucas', 'Lucy', 'Luke', 'Madeline',
+  'Madison', 'Mason', 'Matthew', 'Maya', 'Mia', 'Michael', 'Mila', 'Nathan',
+  'Nicholas', 'Noah', 'Nolan', 'Nora', 'Oliver', 'Olivia', 'Owen', 'Paisley',
+  'Penelope', 'Riley', 'Ryan', 'Samuel', 'Savannah', 'Scarlett', 'Sebastian',
+  'Sofia', 'Sophia', 'Stella', 'Thomas', 'Victoria', 'Violet', 'William', 'Wyatt',
+  'Zachary', 'Zoe',
+];
+const LAST_NAMES = [
+  'Adams', 'Alexander', 'Allen', 'Anderson', 'Bailey', 'Baker', 'Barnes', 'Bell',
+  'Bennett', 'Brooks', 'Brown', 'Bryant', 'Butler', 'Campbell', 'Carter', 'Clark',
+  'Collins', 'Cook', 'Cooper', 'Cox', 'Davis', 'Diaz', 'Edwards', 'Evans',
+  'Fisher', 'Flores', 'Foster', 'Garcia', 'Gonzalez', 'Gray', 'Green', 'Griffin',
+  'Hall', 'Harris', 'Hayes', 'Henderson', 'Hernandez', 'Hill', 'Howard', 'Hughes',
+  'Jackson', 'James', 'Jenkins', 'Johnson', 'Jones', 'Kelly', 'King', 'Lee',
+  'Lewis', 'Long', 'Lopez', 'Martin', 'Martinez', 'Miller', 'Mitchell', 'Moore',
+  'Morgan', 'Morris', 'Murphy', 'Nelson', 'Parker', 'Patterson', 'Perez', 'Perry',
+  'Peterson', 'Phillips', 'Powell', 'Price', 'Ramirez', 'Reed', 'Reyes', 'Richardson',
+  'Rivera', 'Roberts', 'Robinson', 'Rodriguez', 'Rogers', 'Ross', 'Russell',
+  'Sanchez', 'Sanders', 'Scott', 'Simmons', 'Smith', 'Stewart', 'Taylor', 'Thomas',
+  'Thompson', 'Torres', 'Turner', 'Walker', 'Ward', 'Washington', 'Watson', 'White',
+  'Williams', 'Wilson', 'Wood', 'Wright', 'Young', 'Bishop', 'Bowman', 'Boyd',
+  'Bradley', 'Burke', 'Carpenter', 'Chavez', 'Cole', 'Coleman', 'Cruz', 'Daniels',
+  'Dixon', 'Duncan', 'Ellis', 'Ford', 'Gibson', 'Gordon', 'Grant', 'Hamilton',
+  'Harper', 'Hart',
+];
+const MIN_IDENTITY_AGE = 19;
+const MAX_IDENTITY_AGE = 50;
+
+function generateIdentityProfile(): IdentityProfile {
+  return {
+    firstName: pick(FIRST_NAMES),
+    lastName: pick(LAST_NAMES),
+    age: randomInt(MIN_IDENTITY_AGE, MAX_IDENTITY_AGE),
+  };
+}
+
+function pick<T>(items: T[]): T {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function randomInt(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 function maskPhone(phone: string): string {
@@ -746,4 +1150,13 @@ function normalizeSettingSearchText(value: string): string {
 function parseMaxPrice(value: string, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return String(error || 'UNKNOWN_ERROR');
+}
+
+function isEmailRegistrationPending(error?: string): boolean {
+  return error === 'EMAIL_VERIFICATION_PAGE_PENDING' || error === 'EMAIL_REGISTRATION_IN_PROGRESS';
 }
